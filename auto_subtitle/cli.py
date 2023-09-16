@@ -3,8 +3,9 @@ import ffmpeg
 import whisper
 import argparse
 import warnings
-import tempfile
-from .utils import filename, str2bool, write_srt
+from utils import filename, str2bool, write_srt
+from pyannotef import *
+import subprocess
 
 
 def main():
@@ -22,6 +23,8 @@ def main():
                         help="only generate the .srt file and not create overlayed video")
     parser.add_argument("--verbose", type=str2bool, default=False,
                         help="whether to print out the progress and debug messages")
+    parser.add_argument("--multi", type=str2bool, default=False,
+                        help="wheter to use multiple speakers or not  (much longer compute time)")
 
     parser.add_argument("--task", type=str, default="transcribe", choices=[
                         "transcribe", "translate"], help="whether to perform X->X speech recognition ('transcribe') or X->English translation ('translate')")
@@ -34,6 +37,7 @@ def main():
     output_srt: bool = args.pop("output_srt")
     srt_only: bool = args.pop("srt_only")
     language: str = args.pop("language")
+    multi: bool = args.pop("multi")
     
     os.makedirs(output_dir, exist_ok=True)
 
@@ -46,31 +50,65 @@ def main():
         args["language"] = language
         
     model = whisper.load_model(model_name)
-    audios = get_audio(args.pop("video"))
+    audios, outputpath = get_audio(args.pop("video"))
+    if multi:
+        cut_file_speakers(outputpath)
+
     subtitles = get_subtitles(
         audios, output_srt or srt_only, output_dir, lambda audio_path: model.transcribe(audio_path, **args)
     )
-
+    
     if srt_only:
         return
+    
+    for v1,v2 in subtitles.items():
+        path = v1
+        srt_path = v2
 
-    for path, srt_path in subtitles.items():
-        out_path = os.path.join(output_dir, f"{filename(path)}.mp4")
+    forcestyle = "Fontname=Futura,PrimaryColour=&H00FFFF,FontSize=18,SecondaryColour=&H00FFFF,BorderStyle=3,Outline=0,Shadow=0,Alignment=2,MarginL=30,MarginR=30,MarginV=30,BackColour=&H00000000"
 
-        print(f"Adding subtitles to {filename(path)}...")
+    if multi:
+        merge_srt_speaker(srt_path)
+        nb = merge_srt_speaker("./temp/test.srt")
+    
+    out_path = os.path.join(output_dir, f"{filename(path)}.mp4")
 
-        video = ffmpeg.input(path)
-        audio = video.audio
+    print(f"Adding subtitles to {filename(path)}...")
 
+    video = ffmpeg.input(path)
+    audio = video.audio
+
+    #shadow != 0 and outline !=0 makes a black background
+    if not multi:
         ffmpeg.concat(
-            video.filter('subtitles', srt_path, force_style="OutlineColour=&H40000000,BorderStyle=3"), audio, v=1, a=1
+                video.filter('subtitles', srt_path, force_style=forcestyle), audio, v=1, a=1
         ).output(out_path).run(quiet=True, overwrite_output=True)
+    else:    
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-i", path,
+        ]
 
-        print(f"Saved subtitled video to {os.path.abspath(out_path)}.")
+        colors = ["00FFFF","FF00FF","FFFF00","00FF00","FF0000","0000FF","FFFFFF","000000"]
+
+        for i in range(nb):
+            forcestyle_i = forcestyle.replace("00FFFF",colors[i])
+            ffmpeg_cmd.extend([
+                "-vf", f"subtitles=./temp/speaker_{i}.srt:force_style='{forcestyle_i}' [s{i}];"
+            ])
+        ffmpeg_cmd.extend([
+            "-c:a", "copy",
+            "-y",
+            out_path
+        ])
+        subprocess.run(ffmpeg_cmd, check=False)
+
+
+    print(f"Saved subtitled video to {os.path.abspath(out_path)}.")
 
 
 def get_audio(paths):
-    temp_dir = tempfile.gettempdir()
+    temp_dir = "./temp/"
 
     audio_paths = {}
 
@@ -81,18 +119,18 @@ def get_audio(paths):
         ffmpeg.input(path).output(
             output_path,
             acodec="pcm_s16le", ac=1, ar="16k"
-        ).run(quiet=True, overwrite_output=True)
+        ).run(quiet=False, overwrite_output=True)
 
         audio_paths[path] = output_path
 
-    return audio_paths
+    return audio_paths, output_path
 
 
 def get_subtitles(audio_paths: list, output_srt: bool, output_dir: str, transcribe: callable):
     subtitles_path = {}
 
     for path, audio_path in audio_paths.items():
-        srt_path = output_dir if output_srt else tempfile.gettempdir()
+        srt_path = output_dir if output_srt else "./temp/"
         srt_path = os.path.join(srt_path, f"{filename(path)}.srt")
         
         print(
